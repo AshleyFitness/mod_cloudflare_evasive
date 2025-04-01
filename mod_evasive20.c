@@ -52,6 +52,8 @@ module AP_MODULE_DECLARE_DATA evasive20_module;
 #define DEFAULT_SITE_INTERVAL   1       // Default 1 Second site interval
 #define DEFAULT_BLOCKING_PERIOD 10      // Default for Detected IPs; blocked for 10 seconds
 #define DEFAULT_LOG_DIR		"/tmp"  // Default temp directory
+#define DEFAULT_CLOUDFLARE_ENABLED 0 //By default the module will work as the same way, as the creator intended
+
 
 /* END DoS Evasive Maneuvers Definitions */
 
@@ -105,7 +107,9 @@ static int blocking_period = DEFAULT_BLOCKING_PERIOD;
 static char *email_notify = NULL;
 static char *log_dir = NULL;
 static char *system_command = NULL;
+static int  cloudflare_enabled=DEFAULT_CLOUDFLARE_ENABLED;
 static const char *whitelist(cmd_parms *cmd, void *dconfig, const char *ip);
+
 int is_whitelisted(const char *ip);
 
 /* END DoS Evasive Maneuvers Globals */
@@ -126,24 +130,33 @@ static const char *whitelist(cmd_parms *cmd, void *dconfig, const char *ip)
   return NULL;
 }
 
+static const char *get_cloudflare_ip(request_rec *r) {
+  if(!cloudflare_enabled)
+    return r->connection->client_ip;
+  const char *ip = apr_table_get(r->headers_in, "CF-Connecting-IP");
+  if (ip != NULL)
+    return ip;
+  return r->connection->client_ip;
+}
 
 static int access_checker(request_rec *r) 
 {
+
+
     int ret = OK;
 
     /* BEGIN DoS Evasive Maneuvers Code */
-
     if (r->prev == NULL && r->main == NULL && hit_list != NULL) {
       char hash_key[2048];
       struct ntt_node *n;
       time_t t = time(NULL);
 
       /* Check whitelist */
-      if (is_whitelisted(r->connection->remote_ip)) 
+      if (is_whitelisted(get_cloudflare_ip(r))) 
         return OK;
 
       /* First see if the IP itself is on "hold" */
-      n = ntt_find(hit_list, r->connection->remote_ip);
+      n = ntt_find(hit_list, get_cloudflare_ip(r));
 
       if (n != NULL && t-n->timestamp<blocking_period) {
  
@@ -155,14 +168,14 @@ static int access_checker(request_rec *r)
       } else {
 
         /* Has URI been hit too much? */
-        snprintf(hash_key, 2048, "%s_%s", r->connection->remote_ip, r->uri);
+        snprintf(hash_key, 2048, "%s_%s", get_cloudflare_ip(r), r->uri);
         n = ntt_find(hit_list, hash_key);
         if (n != NULL) {
 
           /* If URI is being hit too much, add to "hold" list and 403 */
           if (t-n->timestamp<page_interval && n->count>=page_count) {
             ret = HTTP_FORBIDDEN;
-            ntt_insert(hit_list, r->connection->remote_ip, time(NULL));
+            ntt_insert(hit_list, get_cloudflare_ip(r), time(NULL));
           } else {
 
             /* Reset our hit count list as necessary */
@@ -177,14 +190,14 @@ static int access_checker(request_rec *r)
         }
 
         /* Has site been hit too much? */
-        snprintf(hash_key, 2048, "%s_SITE", r->connection->remote_ip);
+        snprintf(hash_key, 2048, "%s_SITE", get_cloudflare_ip(r));
         n = ntt_find(hit_list, hash_key);
         if (n != NULL) {
 
           /* If site is being hit too much, add to "hold" list and 403 */
           if (t-n->timestamp<site_interval && n->count>=site_count) {
             ret = HTTP_FORBIDDEN;
-            ntt_insert(hit_list, r->connection->remote_ip, time(NULL));
+            ntt_insert(hit_list, get_cloudflare_ip(r), time(NULL));
           } else {
 
             /* Reset our hit count list as necessary */
@@ -205,27 +218,27 @@ static int access_checker(request_rec *r)
         struct stat s;
         FILE *file;
 
-        snprintf(filename, sizeof(filename), "%s/dos-%s", log_dir != NULL ? log_dir : DEFAULT_LOG_DIR, r->connection->remote_ip);
+        snprintf(filename, sizeof(filename), "%s/dos-%s", log_dir != NULL ? log_dir : DEFAULT_LOG_DIR, get_cloudflare_ip(r));
         if (stat(filename, &s)) {
           file = fopen(filename, "w");
           if (file != NULL) {
             fprintf(file, "%ld\n", getpid());
             fclose(file);
 
-            LOG(LOG_ALERT, "Blacklisting address %s: possible DoS attack.", r->connection->remote_ip);
+            LOG(LOG_ALERT, "Blacklisting address %s: possible DoS attack.", get_cloudflare_ip(r));
             if (email_notify != NULL) {
               snprintf(filename, sizeof(filename), MAILER, email_notify);
               file = popen(filename, "w");
               if (file != NULL) {
                 fprintf(file, "To: %s\n", email_notify);
-                fprintf(file, "Subject: HTTP BLACKLIST %s\n\n", r->connection->remote_ip);
-                fprintf(file, "mod_evasive HTTP Blacklisted %s\n", r->connection->remote_ip);
+                fprintf(file, "Subject: HTTP BLACKLIST %s\n\n", get_cloudflare_ip(r));
+                fprintf(file, "mod_evasive HTTP Blacklisted %s\n", get_cloudflare_ip(r));
                 pclose(file);
               }
             }
 
             if (system_command != NULL) {
-              snprintf(filename, sizeof(filename), system_command, r->connection->remote_ip);
+              snprintf(filename, sizeof(filename), system_command, get_cloudflare_ip(r));
               system(filename);
             }
  
@@ -644,6 +657,17 @@ get_system_command(cmd_parms *cmd, void *dconfig, const char *value) {
   return NULL;
 } 
 
+static const char *
+get_cloudflare(cmd_parms * cmd, void *dconfig, const char *value) {
+  if(strcasecmp(  value,"on")==0)
+    cloudflare_enabled=1;
+  else if(strcasecmp(value,"off")==0)
+    cloudflare_enabled=0;
+  else 
+    return "Invalid value for DOSCloudflare. Use 'On' or 'Off'";
+  return NULL;
+}
+
 /* END Configuration Functions */
 
 static const command_rec access_cmds[] =
@@ -674,6 +698,9 @@ static const command_rec access_cmds[] =
 
 	AP_INIT_TAKE1("DOSSystemCommand", get_system_command, NULL, RSRC_CONF,
 		"Set system command on DoS"),
+  
+  AP_INIT_TAKE1("DOSCloudflare",get_cloudflare,NULL,RSRC_CONF,
+  "Enable Cloudflare support"),
 
         AP_INIT_ITERATE("DOSWhitelist", whitelist, NULL, RSRC_CONF,
                 "IP-addresses wildcards to whitelist"),
